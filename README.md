@@ -29,7 +29,7 @@ pip install -r requirements.txt
 # If needed: install CUDA builds of torch/torchaudio from https://pytorch.org
 
 # 1) Copy manifest and fill URLs for: llm.pt, hift.pt, flow.pt (v16 v2!),
-#    campplus.onnx, speech_tokenizer_v1.onnx, s3_tokenizer.pt
+#    campplus.onnx, s3_tokenizer.pt  (speech_tokenizer_v1.onnx optional — omit for this pipeline)
 cp weights_manifest.example.json weights_manifest.json
 ${EDITOR:-vi} weights_manifest.json
 
@@ -65,17 +65,17 @@ Set `HF_TOKEN` if the repo is private.
 ### `weights/` layout after download
 
 - `cosyvoice.yaml` (copied from `configs/` by `download_weights.py`)
-- `llm.pt`, `hift.pt`, `flow.pt`, `campplus.onnx`, `speech_tokenizer_v1.onnx`
-- `s3_tokenizer.pt` — your causal export (name in manifest; `infer.py` takes `--tokenizer_pt` pointing to the same file or a copy)
-
-**Important:** `speech_tokenizer_v1.onnx` is only used for **speaker embedding + mel frontend** in CosyVoice init. **Speech tokens for v16 v2 always come from `--tokenizer_pt` (causal S3), not from ONNX.**
+- **Required for `infer.py`:** `llm.pt`, `hift.pt`, `flow.pt`, `campplus.onnx`
+- **Optional:** `speech_tokenizer_v1.onnx` — only if you call `inference_vc` / `frontend._extract_speech_token` (CosyVoice 50 Hz ONNX path). **Causal-S3 `infer.py` does not need it**; CosyVoice loads without it and uses `--tokenizer_pt` for all speech tokens.
+- **Causal tokenizer:** passed as `infer.py --tokenizer_pt` (can also be listed in manifest as `s3_tokenizer.pt` for download scripts).
 
 ## Publishing weights (checklist)
 
 1. Upload **v16 v2** `flow.pt` (e.g. best-5 average after training).
-2. Upload **v16-compatible** `llm.pt`, `hift.pt`, `campplus.onnx`, `speech_tokenizer_v1.onnx` (same as CosyVoice Emosphere v16 bundle).
-3. Upload **causal** `s3_tokenizer.pt` (same file as training `TOKENIZER_PT` / `extract_speech_token_s3.py`).
-4. Put direct or `hf:` URLs into `weights_manifest.example.json` → share as template.
+2. Upload **v16-compatible** `llm.pt`, `hift.pt`, `campplus.onnx`.
+3. Upload **causal** `s3_tokenizer.pt` (same as training `TOKENIZER_PT`).
+4. **`speech_tokenizer_v1.onnx` — not required** for this repo’s default inference path.
+5. Put direct or `hf:` URLs into `weights_manifest.json` → share as template.
 
 ## CLI reference (`infer.py`)
 

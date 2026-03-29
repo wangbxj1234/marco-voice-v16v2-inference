@@ -10,6 +10,8 @@ This repository vendors minimal inference-time code and assets from:
 
 4. **Emotion conditioning** — logic adapted from Marco-Voice `run_flow_stream_emosphere.py`; quantile stats `assets/emotion_quantiles/q1.pt`, `q3.pt`.
 
+`speech_tokenizer_v1.onnx` is **not required** for the default `infer.py` path (causal S3 tokens only). It remains supported when present for CosyVoice `inference_vc` / ONNX token extraction.
+
 Runtime downloads (not shipped here):
 
 - **emotion2vec_plus_seed** (ModelScope / FunASR)

@@ -19,7 +19,8 @@
     },
     {
       "path": "speech_tokenizer_v1.onnx",
-      "url": ""
+      "url": "",
+      "comment": "OPTIONAL — omit for causal-S3 inference. Only needed for inference_vc() using ONNX speech tokens."
     },
     {
       "path": "s3_tokenizer.pt",

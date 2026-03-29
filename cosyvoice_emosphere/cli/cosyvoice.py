@@ -31,10 +31,17 @@ class CosyVoice:
             model_dir = snapshot_download(model_dir)
         with open('{}/cosyvoice.yaml'.format(model_dir), 'r') as f:
             configs = load_hyperpyyaml(f)
+        _st_onnx = os.path.join(model_dir, 'speech_tokenizer_v1.onnx')
+        _st_arg = _st_onnx if os.path.isfile(_st_onnx) else ''
+        if not _st_arg:
+            logging.info(
+                "speech_tokenizer_v1.onnx not found; ONNX speech-token extract disabled. "
+                "Use causal S3 --tokenizer_pt + model.vc(), or add the onnx file for inference_vc."
+            )
         self.frontend = CosyVoiceFrontEnd(configs['get_tokenizer'],
                                           configs['feat_extractor'],
                                           '{}/campplus.onnx'.format(model_dir),
-                                          '{}/speech_tokenizer_v1.onnx'.format(model_dir),
+                                          _st_arg,
                                           '{}/spk2info.pt'.format(model_dir),
                                           instruct,
                                           configs['allowed_special'])

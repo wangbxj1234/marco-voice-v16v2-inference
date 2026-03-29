@@ -142,7 +142,8 @@ def main() -> None:
 
     prepare_weights_dir(args.weights_dir, _ROOT / "configs" / "cosyvoice.yaml")
 
-    for name in ("llm.pt", "hift.pt", "flow.pt", "campplus.onnx", "speech_tokenizer_v1.onnx"):
+    # speech_tokenizer_v1.onnx is optional: causal-S3 path uses --tokenizer_pt only (see cosyvoice frontend).
+    for name in ("llm.pt", "hift.pt", "flow.pt", "campplus.onnx"):
         p = args.weights_dir / name
         if not p.is_file():
             raise FileNotFoundError(
