@@ -2,7 +2,7 @@
 
 本仓库 **自包含**：因果 S3（1024 @ 25 Hz）+ Emosphere flow 的 **推理**、**数据准备**、**flow 训练** 全部在仓库内完成，**不要求**再 clone Marco-Voice、ft_cosy 或 CosyVoice 其他目录。
 
-大文件（`flow.pt`、`hift.pt`、`campplus.onnx`、因果 `s3_tokenizer.pt`）需你从网盘或 Hugging Face 下载到 `./weights/`（见下文 manifest）。
+**预训练权重已发布**：全部大文件已上传至 Hugging Face 仓库 [**`wbxlala/marcov16v2`**](https://huggingface.co/wbxlala/marcov16v2)（`flow.pt`、`hift.pt`、`campplus.onnx`、因果 `s3_tokenizer.pt` 等）。可直接从该仓库下载到 `./weights/`，或仍用下文 manifest / 自建链接。
 
 ---
 
@@ -32,6 +32,23 @@ export MARCO_PYTHON=/path/to/Marco-Voice/marco/bin/python
 ---
 
 ## 1. 下载权重（推理 + 训练起点）
+
+### 1.1 从 Hugging Face 拉取（推荐）
+
+官方权重仓库：**[https://huggingface.co/wbxlala/marcov16v2](https://huggingface.co/wbxlala/marcov16v2)**
+
+任选其一：
+
+```bash
+# 需已安装 huggingface-cli（pip install huggingface_hub）
+huggingface-cli download wbxlala/marcov16v2 --local-dir weights
+```
+
+或网页进入上述仓库，将所需文件下载到本地 `weights/` 目录。
+
+### 1.2 使用 manifest 脚本
+
+若你使用自建镜像或零散链接：
 
 ```bash
 cp weights_manifest.example.json weights_manifest.json
