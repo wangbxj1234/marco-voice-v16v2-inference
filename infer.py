@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-v16 v2 inference: causal S3 tokenizer (.pt) + CosyVoice Emosphere flow (1024 @ 25 Hz).
+v16 v2 inference: causal S3 tokenizer (.pt) + Emosphere flow (1024 @ 25 Hz).
 
-Run from repo root after `pip install -r requirements.txt` and weights in ./weights/
-(see README.md, scripts/download_weights.py).
+Loads only flow.pt, hift.pt, campplus.onnx + configs/cosyvoice.yaml (no LLM, no CosyVoice text/ONNX tokenizers).
 """
 from __future__ import annotations
 
@@ -25,11 +24,14 @@ def _setup_paths() -> None:
 
 _setup_paths()
 
+import onnxruntime as ort
 import torch
 import torchaudio
+import torchaudio.compliance.kaldi as kaldi
 import whisper
+from hyperpyyaml import load_hyperpyyaml
 
-from cosyvoice_emosphere.cli.cosyvoice import CosyVoice
+from cosyvoice_emosphere.cli.model import CosyVoiceModel
 from emotion_conditioning import extract_emotion2vec_768, extract_low_level_emo
 
 
@@ -92,6 +94,48 @@ def load_s3_tokenizer(tokenizer_pt: str, device: torch.device):
     return model.to(device).eval()
 
 
+def _campplus_session(campplus_onnx: str) -> ort.InferenceSession:
+    option = ort.SessionOptions()
+    option.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    option.intra_op_num_threads = 1
+    return ort.InferenceSession(campplus_onnx, sess_options=option, providers=["CPUExecutionProvider"])
+
+
+@torch.no_grad()
+def extract_spk_embedding(speech_16k: torch.Tensor, session: ort.InferenceSession, device: torch.device) -> torch.Tensor:
+    feat = kaldi.fbank(speech_16k, num_mel_bins=80, dither=0, sample_frequency=16000)
+    feat = feat - feat.mean(dim=0, keepdim=True)
+    name = session.get_inputs()[0].name
+    out = session.run(None, {name: feat.unsqueeze(0).cpu().numpy()})[0].flatten().tolist()
+    return torch.tensor([out], device=device)
+
+
+@torch.no_grad()
+def extract_prompt_mel(
+    speech_22050: torch.Tensor,
+    feat_extractor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    speech_feat = feat_extractor(speech_22050).squeeze(0).transpose(0, 1).to(device)
+    speech_feat = speech_feat.unsqueeze(0)
+    speech_feat_len = torch.tensor([speech_feat.shape[1]], dtype=torch.int32, device=device)
+    return speech_feat, speech_feat_len
+
+
+def load_vc_stack(weights_dir: Path) -> tuple[CosyVoiceModel, callable]:
+    cfg_path = weights_dir / "cosyvoice.yaml"
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"Missing {cfg_path} (copy from configs/ or run scripts/download_weights.py)")
+    with open(cfg_path, encoding="utf-8") as f:
+        configs = load_hyperpyyaml(f)
+    dummy_llm = torch.nn.Module()
+    fm = CosyVoiceModel(dummy_llm, configs["flow"], configs["hift"], fp16=False)
+    flow_pt = weights_dir / "flow.pt"
+    hift_pt = weights_dir / "hift.pt"
+    fm.load(None, str(flow_pt), str(hift_pt))
+    return fm, configs["feat_extractor"]
+
+
 def prepare_weights_dir(weights_dir: Path, config_src: Path) -> None:
     weights_dir.mkdir(parents=True, exist_ok=True)
     dst_yaml = weights_dir / "cosyvoice.yaml"
@@ -102,12 +146,12 @@ def prepare_weights_dir(weights_dir: Path, config_src: Path) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Marco Voice v16 v2 causal-S3 VC / reconstruction")
+    ap = argparse.ArgumentParser(description="Marco Voice v16 v2 causal-S3 VC / reconstruction (flow+hift only)")
     ap.add_argument(
         "--weights_dir",
         type=Path,
         default=_ROOT / "weights",
-        help="Directory with cosyvoice.yaml, llm.pt, hift.pt, flow.pt, campplus.onnx, speech_tokenizer_v1.onnx",
+        help="Directory with cosyvoice.yaml, hift.pt, flow.pt, campplus.onnx",
     )
     ap.add_argument("--tokenizer_pt", type=Path, default=None, help="Causal S3 tokenizer export .pt")
     ap.add_argument("--prompt_wav", type=Path, default=None)
@@ -131,7 +175,7 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.smoke_imports:
-        print("smoke_imports: OK (cosyvoice_emosphere, s3tokenizer_train, emotion_conditioning)")
+        print("smoke_imports: OK (CosyVoiceModel, s3tokenizer_train, emotion_conditioning)")
         return
 
     if args.tokenizer_pt is None or args.prompt_wav is None:
@@ -142,8 +186,7 @@ def main() -> None:
 
     prepare_weights_dir(args.weights_dir, _ROOT / "configs" / "cosyvoice.yaml")
 
-    # speech_tokenizer_v1.onnx is optional: causal-S3 path uses --tokenizer_pt only (see cosyvoice frontend).
-    for name in ("llm.pt", "hift.pt", "flow.pt", "campplus.onnx"):
+    for name in ("hift.pt", "flow.pt", "campplus.onnx"):
         p = args.weights_dir / name
         if not p.is_file():
             raise FileNotFoundError(
@@ -164,22 +207,19 @@ def main() -> None:
     print(f"[causal_s3] loading tokenizer: {tok_abs}")
     s3_model = load_s3_tokenizer(str(tok_abs), device)
     tok_cache: dict = {}
-    print(
-        "[causal_s3] S3TokenizerV1.tokenize(whisper.log_mel_spectrogram) — not speech_tokenizer_v1.onnx"
-    )
 
-    model_dir = str(args.weights_dir.resolve())
-    print(f"Loading CosyVoice from {model_dir} ...")
-    cosy = CosyVoice(model_dir, load_jit=False, load_onnx=False, fp16=False)
+    print(f"Loading flow+hift from {args.weights_dir.resolve()} ...")
+    fm, feat_extractor = load_vc_stack(args.weights_dir)
+    campplus_path = str((args.weights_dir / "campplus.onnx").resolve())
+    spk_session = _campplus_session(campplus_path)
 
     if args.flow_ckpt is not None:
         ckpt = torch.load(args.flow_ckpt, map_location="cpu", weights_only=False)
-        cosy.model.flow.load_state_dict(ckpt, strict=False)
-        cosy.model.flow.eval()
-        if torch.cuda.is_available():
-            cosy.model.flow.cuda()
+        fm.flow.load_state_dict(ckpt, strict=False)
+        fm.flow.eval()
+        if device.type == "cuda":
+            fm.flow.cuda()
 
-    fm = cosy.model
     if args.hop_tokens > 0:
         h = int(args.hop_tokens)
         fm.token_min_hop_len = h
@@ -193,8 +233,8 @@ def main() -> None:
             prompt_16k = prompt_16k[:, :max_n]
 
     prompt_22050 = torchaudio.transforms.Resample(16000, 22050)(prompt_16k)
-    prompt_feat, _ = cosy.frontend._extract_speech_feat(prompt_22050)
-    flow_embedding = cosy.frontend._extract_spk_embedding(prompt_16k)
+    prompt_feat, _ = extract_prompt_mel(prompt_22050, feat_extractor, device)
+    flow_embedding = extract_spk_embedding(prompt_16k, spk_session, device)
 
     prompt_tok = wav16k_to_s3_tokens(prompt_16k, s3_model, device, tok_cache)
     source_tok = wav16k_to_s3_tokens(source_16k, s3_model, device, tok_cache)
@@ -205,7 +245,7 @@ def main() -> None:
     low_level_emo = extract_low_level_emo(str(source_path), emo_id=args.emo_id)
 
     chunks = []
-    for out in cosy.model.vc(
+    for out in fm.vc(
         source_speech_token=source_tok,
         flow_prompt_speech_token=prompt_tok,
         prompt_speech_feat=prompt_feat,

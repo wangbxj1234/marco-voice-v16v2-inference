@@ -11,3 +11,7 @@ outputs/*
 !outputs/.gitkeep
 .cache_emotion2vec/
 weights_manifest.json
+exp/
+tensorboard/
+training/smoke_workspace/
+.verify_runtime_weights/

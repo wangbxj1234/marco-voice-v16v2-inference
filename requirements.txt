@@ -10,9 +10,12 @@ omegaconf
 modelscope
 funasr>=1.0.0
 transformers>=4.36.0
-inflect
-WeTextProcessing
 conformer
 einops
 diffusers
 huggingface_hub>=0.20.0
+# Training / parquet (same install for one-shot reproducibility)
+deepspeed>=0.12.0
+tensorboard
+pandas
+pyarrow

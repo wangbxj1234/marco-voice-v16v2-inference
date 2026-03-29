@@ -3,7 +3,13 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
-PYTHON="${PYTHON:-python3}"
+# Same interpreter as Marco-Voice training when this repo lives under the monorepo (Training/*.sh use ../marco/bin/python).
+_MARCO_PY="$(cd "$ROOT/.." && pwd)/marco/bin/python"
+if [[ -z "${PYTHON:-}" && -x "$_MARCO_PY" ]]; then
+  PYTHON="$_MARCO_PY"
+else
+  PYTHON="${PYTHON:-python3}"
+fi
 
 echo "=== [1/2] Import smoke (no weights) ==="
 $PYTHON infer.py --smoke_imports
@@ -13,14 +19,18 @@ if [[ ! -f "$ROOT/weights/flow.pt" ]]; then
   echo "SKIP: no weights/flow.pt — copy weights or run:"
   echo "  cp weights_manifest.example.json weights_manifest.json  # then edit URLs"
   echo "  python scripts/download_weights.py --manifest weights_manifest.json"
-  echo "Then: export TOKENIZER_PT=/path/to/causal_s3_export.pt"
-  echo "      $PYTHON infer.py --tokenizer_pt \"\$TOKENIZER_PT\" --prompt_wav sample_inputs/synthetic_3s_16k.wav"
+  echo "Then: export TOKENIZER_PT=weights/s3_tokenizer.pt   # or absolute path"
+  echo "      $PYTHON infer.py --weights_dir weights --tokenizer_pt \"\$TOKENIZER_PT\" --prompt_wav sample_inputs/synthetic_3s_16k.wav"
   exit 0
 fi
 
 if [[ -z "${TOKENIZER_PT:-}" ]]; then
-  echo "SKIP: set TOKENIZER_PT to your causal S3 tokenizer .pt"
-  exit 0
+  if [[ -f "$ROOT/weights/s3_tokenizer.pt" ]]; then
+    TOKENIZER_PT="$ROOT/weights/s3_tokenizer.pt"
+  else
+    echo "SKIP: set TOKENIZER_PT or place weights/s3_tokenizer.pt"
+    exit 0
+  fi
 fi
 
 $PYTHON infer.py \

@@ -1,0 +1,3 @@
+# Training deps are included in the repository root requirements.txt (deepspeed, tensorboard, pandas, pyarrow).
+# Install once:  pip install -r requirements.txt
+# from the repo root after sourcing training/path.sh is not required for pip.

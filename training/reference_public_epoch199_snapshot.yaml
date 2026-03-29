@@ -1,0 +1,52 @@
+# ---------------------------------------------------------------------------
+# Public snapshot of Marco Voice v16 v2 flow training near the end of the run
+# (epoch 199 / max_epoch 200), for reproducibility and fine-tuning reference.
+#
+# Source: internal checkpoint meta `epoch_199_whole.yaml` from experiment
+# `cosyvoice_emosphere_v16_v2_rerun158`, config `cosyvoice_emosphere_v16_v2_resume_lowlr.yaml`.
+# Paths and binary tensor fields are omitted.
+# ---------------------------------------------------------------------------
+
+experiment_tag: cosyvoice_emosphere_v16_v2_rerun158
+model: flow
+train_engine: torch_ddp
+dtype: fp32
+use_amp: false
+
+# Schedule (WarmupLR): peak Adam LR in yaml × decay; warmup_steps fixed at 93.
+train_conf_peak_lr_stage1: 0.001        # conf/cosyvoice_emosphere_v16_v2.yaml (epochs 0–129)
+train_conf_peak_lr_stage2: 0.0002       # conf/cosyvoice_emosphere_v16_v2_resume_lowlr.yaml (epochs 130–199)
+warmup_steps: 93
+scheduler: warmuplr
+max_epoch: 200
+grad_clip: 5
+accum_grad: 1
+log_interval: 10
+
+# At end of epoch 199 (CV pass), optimizer’s current LR (already in decay tail):
+lr_logged_at_epoch_199_end: 2.4755809063173895e-05
+
+# Global step counter at end of epoch 199:
+global_step_at_epoch_199_end: 6070
+
+# When resuming from epoch 129 → start_epoch 130, this was passed as --resume_train_step
+# so WarmupLR stayed aligned with the previous run’s step count:
+resume_train_step_ep130: 3921
+
+# Dataloader / distributed (same as published training scripts):
+num_workers: 2
+prefetch: 100
+pin_memory: true
+ddp_dist_backend: nccl
+deepspeed_config: training/conf/ds_stage2.json
+deepspeed_save_states: model+optimizer
+
+# Dynamic batching (from yaml data pipeline):
+batch_type: dynamic
+max_frames_in_batch: 50000
+
+# DeepSpeed JSON (optimizer block is present for ZeRO; executor still uses yaml train_conf for LR):
+deepspeed_optimizer_type: AdamW
+deepspeed_optimizer_lr_in_json: 0.001
+deepspeed_weight_decay: 0.0001
+zero_stage: 2

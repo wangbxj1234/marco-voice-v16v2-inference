@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import torch
 import numpy as np
 import threading
@@ -56,10 +57,13 @@ class CosyVoiceModel:
         self.hift_cache_dict = {}
 
     def load(self, llm_model, flow_model, hift_model):
-        self.llm.load_state_dict(torch.load(llm_model, map_location=self.device), strict=False)
-        self.llm.to(self.device).eval()
-        if self.fp16 is True:
-            self.llm.half()
+        if llm_model is not None:
+            lm = os.fspath(llm_model).strip()
+            if lm and os.path.isfile(lm):
+                self.llm.load_state_dict(torch.load(lm, map_location=self.device), strict=False)
+                self.llm.to(self.device).eval()
+                if self.fp16 is True:
+                    self.llm.half()
         self.flow.load_state_dict(torch.load(flow_model, map_location=self.device), strict=False)
         self.flow.to(self.device).eval()
         # in case hift_model is a hifigan model

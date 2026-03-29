@@ -1,117 +1,166 @@
-# Marco Voice — v16 v2 inference (standalone)
+# Marco Voice — v16 v2（独立仓库：推理 + 微调）
 
-Self-contained **git repository** for **causal S3 speech tokens (1024 @ 25 Hz) + Emosphere flow** reconstruction / VC.  
-No dependency on the full Marco-Voice training tree: everything required to **run `infer.py`** is under this directory.
+本仓库 **自包含**：因果 S3（1024 @ 25 Hz）+ Emosphere flow 的 **推理**、**数据准备**、**flow 训练** 全部在仓库内完成，**不要求**再 clone Marco-Voice、ft_cosy 或 CosyVoice 其他目录。
 
-## What you get
+大文件（`flow.pt`、`hift.pt`、`campplus.onnx`、因果 `s3_tokenizer.pt`）需你从网盘或 Hugging Face 下载到 `./weights/`（见下文 manifest）。
 
-- `infer.py` — load weights, causal-tokenize with **your** `s3_tokenizer.pt`, run `CosyVoiceModel.vc()`, write 22.05 kHz WAV.
-- `cosyvoice_emosphere/` — Emosphere CosyVoice Python package (inference path only).
-- `third_party/Matcha-TTS/` — mel backend for YAML.
-- `s3tokenizer_train/` — minimal modules to load the causal S3 export checkpoint (`S3TokenizerV1`).
-- `emotion_conditioning.py` + `assets/emotion_quantiles/` — emotion2vec + VAD→polar (same as Marco-Voice streaming script).
-- `configs/cosyvoice.yaml` — flow definition: **vocab 1024, 25 Hz**, matches v16 v2 training.
-- `scripts/download_weights.py` — fill `weights_manifest.json` with HTTPS or `hf:org/repo:file` URLs.
-- `sample_inputs/synthetic_3s_16k.wav` — tiny clip for smoke tests.
+---
 
-Large **binary weights are not in git** (`.gitignore`). You host them (Hugging Face, object storage, release assets) and point the manifest at them.
+## 0. 环境（任选其一）
 
-## Quick start
+### A. 已有 CUDA PyTorch（推荐与训练时一致）
 
 ```bash
-git clone <YOUR_REPO_URL> marco-voice-v16v2-inference
 cd marco-voice-v16v2-inference
-
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -U pip
+# 按你的 CUDA 版本从 https://pytorch.org 安装 torch / torchaudio 后：
 pip install -r requirements.txt
-# If needed: install CUDA builds of torch/torchaudio from https://pytorch.org
+```
 
-# 1) Copy manifest and fill URLs for: llm.pt, hift.pt, flow.pt (v16 v2!),
-#    campplus.onnx, s3_tokenizer.pt  (speech_tokenizer_v1.onnx optional — omit for this pipeline)
+### B. 与 Marco-Voice 同机、使用其 `marco` 环境（可选）
+
+若本目录在 Marco-Voice 旁且存在 `../marco/bin/python`，可直接：
+
+```bash
+export MARCO_PYTHON=/path/to/Marco-Voice/marco/bin/python
+# 下文凡 `python` 均可换为 `"$MARCO_PYTHON"`
+```
+
+`verify.sh` 在未设置 `PYTHON` 时会自动探测 `../marco/bin/python`。
+
+---
+
+## 1. 下载权重（推理 + 训练起点）
+
+```bash
 cp weights_manifest.example.json weights_manifest.json
-${EDITOR:-vi} weights_manifest.json
-
+# 编辑 weights_manifest.json：为 flow.pt / hift.pt / campplus.onnx / s3_tokenizer.pt 填入 https:// 或 hf:org/repo:file 链接
 python scripts/download_weights.py --manifest weights_manifest.json --output-dir weights
+```
 
-# 2) causal S3 tokenizer .pt — MUST match the export used when building training parquet
-export TOKENIZER_PT=/path/to/your/s3tokenizer_export.pt
+完成后应存在：
 
-# 3) Verify imports (no GPU weights load)
-python infer.py --smoke_imports
+- `weights/flow.pt` `weights/hift.pt` `weights/campplus.onnx`
+- `weights/cosyvoice.yaml`（脚本从 `configs/cosyvoice.yaml` 复制）
+- `weights/s3_tokenizer.pt`（因果 S3 导出，与训练 parquet 必须使用**同一**导出）
 
-# 4) Run reconstruction on bundled synthetic wav
+---
+
+## 2. 推理（复制即可运行）
+
+```bash
+source training/path.sh
 python infer.py \
   --weights_dir weights \
-  --tokenizer_pt "$TOKENIZER_PT" \
+  --tokenizer_pt weights/s3_tokenizer.pt \
   --prompt_wav sample_inputs/synthetic_3s_16k.wav \
   --out_wav outputs/demo.wav
-
-bash verify.sh   # runs smoke; full step if weights + TOKENIZER_PT present
 ```
 
-### Hugging Face Hub URL format
+首次运行会从 ModelScope / Hugging Face **自动拉取** emotion2vec 与 wav2vec（需联网），属正常现象。
 
-In `weights_manifest.json` you can use:
-
-```json
-"url": "hf:YourOrg/your-weight-repo:flow.pt"
-```
-
-(`repo_id` = `YourOrg/your-weight-repo`, file path = `flow.pt`.)  
-Set `HF_TOKEN` if the repo is private.
-
-### `weights/` layout after download
-
-- `cosyvoice.yaml` (copied from `configs/` by `download_weights.py`)
-- **Required for `infer.py`:** `llm.pt`, `hift.pt`, `flow.pt`, `campplus.onnx`
-- **Optional:** `speech_tokenizer_v1.onnx` — only if you call `inference_vc` / `frontend._extract_speech_token` (CosyVoice 50 Hz ONNX path). **Causal-S3 `infer.py` does not need it**; CosyVoice loads without it and uses `--tokenizer_pt` for all speech tokens.
-- **Causal tokenizer:** passed as `infer.py --tokenizer_pt` (can also be listed in manifest as `s3_tokenizer.pt` for download scripts).
-
-## Publishing weights (checklist)
-
-1. Upload **v16 v2** `flow.pt` (e.g. best-5 average after training).
-2. Upload **v16-compatible** `llm.pt`, `hift.pt`, `campplus.onnx`.
-3. Upload **causal** `s3_tokenizer.pt` (same as training `TOKENIZER_PT`).
-4. **`speech_tokenizer_v1.onnx` — not required** for this repo’s default inference path.
-5. Put direct or `hf:` URLs into `weights_manifest.json` → share as template.
-
-## CLI reference (`infer.py`)
-
-| Argument | Description |
-|----------|-------------|
-| `--weights_dir` | Default `./weights` |
-| `--tokenizer_pt` | Causal S3 export `.pt` (required) |
-| `--prompt_wav` | 16 kHz+ WAV (resampled internally) |
-| `--source_wav` | Optional; default = prompt (self-reconstruction) |
-| `--out_wav` | Default `./outputs/reconstruction.wav` |
-| `--flow_ckpt` | Optional override for flow state dict |
-| `--hop_tokens` | Optional streaming hop override |
-| `--device` | `cuda` or `cpu` |
-| `--smoke_imports` | Only test imports |
-
-## Parent Marco-Voice repo
-
-If you keep this folder **inside** the full Marco-Voice monorepo, `../run_vc_s3causal_emosphere.py` is a thin wrapper that forwards to `infer.py` with legacy flag names (`--model_dir`, `--out_dir`, `--output`).
-
-## Publish **only** this tree to GitHub
-
-From the parent repo (or after copying this folder elsewhere):
+自检（不加载大权重）：
 
 ```bash
-cd marco-voice-v16v2-inference
-git init
-git add -A
-git status   # confirm weights/*.pt are NOT staged (.gitignore)
-git commit -m "Marco Voice v16 v2 standalone inference"
-git branch -M main
-git remote add origin git@github.com:YOUR_ORG/marco-voice-v16v2-inference.git
-git push -u origin main
+python infer.py --smoke_imports
+bash verify.sh
 ```
 
-Clone size is ~**100 MB+** mainly due to `cosyvoice_emosphere/tokenizer/assets/*.tiktoken` (Whisper text tokenizer assets pulled in by the YAML `get_tokenizer` path).
+---
 
-## License
+## 3. 训练 / 微调（全流程在仓库内）
 
-See `LICENSE` and `NOTICE.md`.
+### 3.1 准备自己的 Emosphere 目录
+
+目录内需有：`wav.scp`、`text`、`utt2spk`、`utt2embedding.pt`、`spk2embedding.pt`、`utt_emo.pt`、`emotion_embedding.pt`、`low_level_embedding.pt`（与主项目 Emosphere 数据格式一致）。
+
+对目录 `SRC_DIR` 抽取因果 token 并写 `utt2speech_token.pt`：
+
+```bash
+source training/path.sh
+python training/tools/extract_speech_token_s3.py \
+  --dir "$SRC_DIR" \
+  --tokenizer_pt weights/s3_tokenizer.pt \
+  --device cuda \
+  --batch_size 32
+```
+
+生成 parquet + `data.list`：
+
+```bash
+export SRC_DIR=/path/to/your_processed_train
+export DES_DIR=/path/to/parquet_out
+bash training/scripts/prep_parquet_s3causal.sh
+# 训练时使用：MARCO_V16V2_DATA_LIST=$DES_DIR/data.list
+```
+
+若只有带 `audio_data` 的旧 parquet，可用仓库内工具重算 `speech_token`：
+
+```bash
+python training/tools/retokenize_parquet_s3.py \
+  --in_list /path/to/old/data.list \
+  --out_dir /path/to/new_shards \
+  --out_list /path/to/new/data.list \
+  --tokenizer_pt weights/s3_tokenizer.pt
+```
+
+完整说明与公开超参（含 epoch≈199 学习率快照）：**`training/docs/FINETUNING.md`**
+
+### 3.2 启动 flow 训练
+
+```bash
+source training/path.sh
+export MARCO_V16V2_DATA_LIST=/path/to/parquet_out/data.list
+export FLOW_INIT_CKPT=weights/flow.pt    # 或你自己的 checkpoint
+export CUDA_VISIBLE_DEVICES=0,1
+bash training/scripts/run_train_flow_v16v2.sh
+```
+
+平台期后降低峰值学习率续训：
+
+```bash
+export MARCO_RESUME_CKPT=exp/.../epoch_129_whole.pt
+export PREV_YAML=exp/.../epoch_129_whole.yaml
+export MARCO_V16V2_DATA_LIST=...
+bash training/scripts/run_resume_lowlr_after_plateau.sh
+```
+
+---
+
+## 4. 一键验证（推理 + smoke 数据 + 1 epoch 训练）
+
+在已安装依赖、有 **GPU** 的机器上，用本地权重目录与因果 tokenizer 路径：
+
+```bash
+source training/path.sh
+export TOKENIZER_PT=/abs/path/to/s3_tokenizer.pt    # 或 weights/s3_tokenizer.pt
+export WEIGHTS_DIR=/abs/path/to/dir_with_flow_hift_campplus
+bash scripts/verify_end_to_end.sh
+```
+
+该脚本会：复制权重到 `.verify_runtime_weights/` → 跑 `infer.py` → 用内置 `sample_inputs` 建最小 parquet → 用 `training/conf/cosyvoice_emosphere_v16_v2_smoke1.yaml`（`max_epoch: 1`）跑 **单卡** flow 训练并跳过 checkpoint 平均。
+
+**已在以下环境跑通（exit 0）**：`WEIGHTS_DIR=Marco-Voice/pretrained_models/marco_voice/cosyvoice_emosphere_v16_v2`（`cp -L` 解析 symlink）+ 与训练一致的因果 `s3_tokenizer` 导出 `.pt`。
+
+---
+
+## 5. 仓库结构（与复现相关）
+
+| 路径 | 作用 |
+|------|------|
+| `infer.py` | 推理入口 |
+| `configs/cosyvoice.yaml` | 推理用 flow/hift 结构（无 LLM 权重） |
+| `training/conf/cosyvoice_emosphere_v16_v2*.yaml` | 训练用完整 HyperPyYAML（`--model flow`） |
+| `training/tools/extract_speech_token_s3.py` | 写 `utt2speech_token.pt` |
+| `training/tools/make_parquet_list_eposhere.py` | parquet + data.list |
+| `training/tools/retokenize_parquet_s3.py` | 从 parquet 内音频重算 token |
+| `training/scripts/run_train_flow_v16v2.sh` | DDP + DeepSpeed 训练 |
+| `training/path.sh` | `source` 后设置 `PYTHONPATH` |
+| `scripts/verify_end_to_end.sh` | 全栈验证 |
+
+---
+
+## 6. License
+
+见 `LICENSE`、`NOTICE.md`。

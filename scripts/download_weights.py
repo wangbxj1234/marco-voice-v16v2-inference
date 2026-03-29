@@ -76,7 +76,8 @@ def main() -> None:
         dest = args.output_dir / name
         download_one(url, dest)
 
-    print("Done. Next: python infer.py --tokenizer_pt /path/to/s3_tokenizer.pt --prompt_wav ...")
+    print("Done.")
+    print("Infer:  source training/path.sh && python infer.py --weights_dir weights --tokenizer_pt weights/s3_tokenizer.pt --prompt_wav sample_inputs/synthetic_3s_16k.wav")
 
 
 if __name__ == "__main__":

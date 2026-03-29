@@ -1,8 +1,8 @@
 {
-  "comment": "Copy to weights_manifest.json and set URLs. Use hf:org/repo:path for Hugging Face Hub.",
+  "comment": "Copy to weights_manifest.json and set every url (https://... or hf:org/repo:path). All four binaries are required for the documented pipelines.",
   "files": [
     {
-      "path": "llm.pt",
+      "path": "flow.pt",
       "url": ""
     },
     {
@@ -10,22 +10,13 @@
       "url": ""
     },
     {
-      "path": "flow.pt",
-      "url": ""
-    },
-    {
       "path": "campplus.onnx",
       "url": ""
     },
     {
-      "path": "speech_tokenizer_v1.onnx",
-      "url": "",
-      "comment": "OPTIONAL — omit for causal-S3 inference. Only needed for inference_vc() using ONNX speech tokens."
-    },
-    {
       "path": "s3_tokenizer.pt",
       "url": "",
-      "comment": "Same causal S3 export as training (e.g. s3tokenizer_export_epoch15.pt); rename locally if needed"
+      "comment": "Causal S3 export (config+model); same file for infer.py --tokenizer_pt and extract_speech_token_s3.py"
     }
   ]
 }
