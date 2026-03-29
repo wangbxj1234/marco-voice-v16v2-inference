@@ -1,22 +1,25 @@
 {
-  "comment": "Copy to weights_manifest.json and set every url (https://... or hf:org/repo:path). All four binaries are required for the documented pipelines.",
+  "comment": "Copy to weights_manifest.json. hift + campplus use official Marco-Voice on Hugging Face. flow.pt + s3_tokenizer.pt are YOUR trained artifacts — upload to your own URL or HF repo and fill urls below.",
   "files": [
     {
       "path": "flow.pt",
-      "url": ""
+      "url": "",
+      "comment": "YOUR v16 v2 flow — see README / team paths under Marco-Voice repo"
     },
     {
       "path": "hift.pt",
-      "url": ""
+      "url": "hf:AIDC-AI/Marco-Voice:marco_voice/hift.pt",
+      "comment": "Official Marco (same as cosyvoice_emosphere bundle), not v16_v2-trained"
     },
     {
       "path": "campplus.onnx",
-      "url": ""
+      "url": "hf:AIDC-AI/Marco-Voice:marco_voice/campplus.onnx",
+      "comment": "Official Marco, not v16_v2-trained"
     },
     {
       "path": "s3_tokenizer.pt",
       "url": "",
-      "comment": "Causal S3 export (config+model); same file for infer.py --tokenizer_pt and extract_speech_token_s3.py"
+      "comment": "YOUR causal S3 export (same as training TOKENIZER_PT) — see README"
     }
   ]
 }
