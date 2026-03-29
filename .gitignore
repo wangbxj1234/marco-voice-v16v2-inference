@@ -1,0 +1,13 @@
+.venv/
+venv/
+**/__pycache__/
+__pycache__/
+*.py[cod]
+*.wav
+!sample_inputs/*.wav
+weights/*
+!weights/.gitkeep
+outputs/*
+!outputs/.gitkeep
+.cache_emotion2vec/
+weights_manifest.json

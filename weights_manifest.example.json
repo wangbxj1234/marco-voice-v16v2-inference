@@ -1,0 +1,30 @@
+{
+  "comment": "Copy to weights_manifest.json and set URLs. Use hf:org/repo:path for Hugging Face Hub.",
+  "files": [
+    {
+      "path": "llm.pt",
+      "url": ""
+    },
+    {
+      "path": "hift.pt",
+      "url": ""
+    },
+    {
+      "path": "flow.pt",
+      "url": ""
+    },
+    {
+      "path": "campplus.onnx",
+      "url": ""
+    },
+    {
+      "path": "speech_tokenizer_v1.onnx",
+      "url": ""
+    },
+    {
+      "path": "s3_tokenizer.pt",
+      "url": "",
+      "comment": "Same causal S3 export as training (e.g. s3tokenizer_export_epoch15.pt); rename locally if needed"
+    }
+  ]
+}

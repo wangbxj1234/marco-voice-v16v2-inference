@@ -1,0 +1,18 @@
+# Python >= 3.10 recommended. CUDA PyTorch wheel: install from https://pytorch.org first if needed.
+torch>=2.1.0
+torchaudio>=2.1.0
+openai-whisper
+onnxruntime
+numpy
+tqdm
+HyperPyYAML
+omegaconf
+modelscope
+funasr>=1.0.0
+transformers>=4.36.0
+inflect
+WeTextProcessing
+conformer
+einops
+diffusers
+huggingface_hub>=0.20.0
