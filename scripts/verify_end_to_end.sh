@@ -36,7 +36,7 @@ echo "=== [1/3] Inference ==="
 "${PY}" "${ROOT}/infer.py" \
   --weights_dir "${VERIFY_W}" \
   --tokenizer_pt "${TOKENIZER_PT}" \
-  --prompt_wav "${ROOT}/sample_inputs/synthetic_3s_16k.wav" \
+  --prompt_wav "${ROOT}/sample_inputs/esd_source_spk0002_neutral_u000282_long.wav" \
   --out_wav "${ROOT}/outputs/verify_e2e_infer.wav"
 
 echo "=== [2/3] Smoke parquet (extract + make_parquet) ==="

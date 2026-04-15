@@ -15,7 +15,7 @@ else
 fi
 
 TOKENIZER_PT="${TOKENIZER_PT:?Set TOKENIZER_PT to causal S3 export .pt}"
-WAV="${SMOKE_WAV:-${REPO_ROOT}/sample_inputs/synthetic_3s_16k.wav}"
+WAV="${SMOKE_WAV:-${REPO_ROOT}/sample_inputs/esd_source_spk0002_neutral_u000282_long.wav}"
 RAW="${REPO_ROOT}/training/smoke_workspace/raw"
 PARQ="${REPO_ROOT}/training/smoke_workspace/parquet"
 

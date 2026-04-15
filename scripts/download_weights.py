@@ -77,7 +77,11 @@ def main() -> None:
         download_one(url, dest)
 
     print("Done.")
-    print("Infer:  source training/path.sh && python infer.py --weights_dir weights --tokenizer_pt weights/s3_tokenizer.pt --prompt_wav sample_inputs/synthetic_3s_16k.wav")
+    print(
+        "Infer:  source training/path.sh && python infer.py --weights_dir weights "
+        "--tokenizer_pt weights/s3_tokenizer.pt "
+        "--prompt_wav sample_inputs/esd_source_spk0002_neutral_u000282_long.wav"
+    )
 
 
 if __name__ == "__main__":

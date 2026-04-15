@@ -20,7 +20,7 @@ if [[ ! -f "$ROOT/weights/flow.pt" ]]; then
   echo "  cp weights_manifest.example.json weights_manifest.json  # then edit URLs"
   echo "  python scripts/download_weights.py --manifest weights_manifest.json"
   echo "Then: export TOKENIZER_PT=weights/s3_tokenizer.pt   # or absolute path"
-  echo "      $PYTHON infer.py --weights_dir weights --tokenizer_pt \"\$TOKENIZER_PT\" --prompt_wav sample_inputs/synthetic_3s_16k.wav"
+  echo "      $PYTHON infer.py --weights_dir weights --tokenizer_pt \"\$TOKENIZER_PT\" --prompt_wav sample_inputs/esd_source_spk0002_neutral_u000282_long.wav"
   exit 0
 fi
 
@@ -36,7 +36,7 @@ fi
 $PYTHON infer.py \
   --weights_dir "$ROOT/weights" \
   --tokenizer_pt "$TOKENIZER_PT" \
-  --prompt_wav "$ROOT/sample_inputs/synthetic_3s_16k.wav" \
+  --prompt_wav "$ROOT/sample_inputs/esd_source_spk0002_neutral_u000282_long.wav" \
   --out_wav "$ROOT/outputs/verify_out.wav"
 
 echo "OK: wrote outputs/verify_out.wav"

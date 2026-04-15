@@ -68,16 +68,22 @@ python scripts/download_weights.py --manifest weights_manifest.json --output-dir
 
 ## 2. 推理（复制即可运行）
 
+**用哪个 `python`**：在 §0 创建的虚拟环境里先 `source .venv/bin/activate`，下面命令里的 `python` 即该环境；或与 Marco-Voice 同目录树时用固定路径，例如  
+`/path/to/Marco-Voice/marco/bin/python infer.py ...`（`verify.sh` 会自动探测 `../marco/bin/python`）。
+
+**示例输入**：仓库自带 **`sample_inputs/esd_source_spk0002_neutral_u000282_long.wav`**（ESD 长句，与 flow streaming 复现脚本默认一致）。未传 `--source_wav` 时与 `--prompt_wav` 相同，即自重建。
+
 ```bash
+cd marco-voice-v16v2-inference
 source training/path.sh
 python infer.py \
   --weights_dir weights \
   --tokenizer_pt weights/s3_tokenizer.pt \
-  --prompt_wav sample_inputs/synthetic_3s_16k.wav \
+  --prompt_wav sample_inputs/esd_source_spk0002_neutral_u000282_long.wav \
   --out_wav outputs/demo.wav
 ```
 
-首次运行会从 ModelScope / Hugging Face **自动拉取** emotion2vec 与 wav2vec（需联网），属正常现象。
+首次运行会从 ModelScope / Hugging Face **自动拉取** emotion2vec 与 wav2vec（需联网），属正常现象。读 wav / 写 wav 走 **torchaudio**；若解码报错请本机安装 **FFmpeg**（如 `apt-get install -y ffmpeg`）。
 
 自检（不加载大权重）：
 
