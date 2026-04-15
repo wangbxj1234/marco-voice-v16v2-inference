@@ -4,6 +4,8 @@
 
 **预训练权重已发布**：全部大文件已上传至 Hugging Face 仓库 [**`wbxlala/marcov16v2`**](https://huggingface.co/wbxlala/marcov16v2)（`flow.pt`、`hift.pt`、`campplus.onnx`、因果 `s3_tokenizer.pt` 等）。可直接从该仓库下载到 `./weights/`，或仍用下文 manifest / 自建链接。
 
+**与 Marco-Voice 主仓同机时**：请先阅读主仓根目录的 **`WORK_SUMMARY.md`**（路径示例：`Marco-Voice-main/WORK_SUMMARY.md`）。其中 **「补充：v16 v2 起点修正」「低学习率续训」「v16 v2 重建测评工作流」** 等节写明了：因果 **`TOKENIZER_PT` 必须与建 `parquet_s3causal25hz` 时一致**、`FLOW_INIT_CKPT` / `epoch_158_whole.pt` 来源、`data.list` 位置、rerun158 实验名与推理用 `flow.pt` 关系等。**不要只读本 README 就猜路径。** 本仓库脚本与主仓 `Training/*.sh` 的对照、软链复用 `.pt` 见 **`training/docs/MARCO_TRAINING_PARITY.md`**。
+
 ---
 
 ## 0. 环境（任选其一）
@@ -82,6 +84,37 @@ python infer.py \
 ```bash
 python infer.py --smoke_imports
 bash verify.sh
+```
+
+### 2.1 复现 Flow Streaming v2（epoch 92，hop=8）
+
+我们将 flow streaming v2 的 `epoch_92_whole.pt`（CV 最优候选）公开在：
+
+- [ft_flowv2_epoch_92_whole.pt (Google Drive)](https://drive.google.com/file/d/1F4upBZ0mX6BKLO1S2dF3lrd7VyvP35sA/view?usp=drive_link)
+
+下载后可直接运行复现脚本（默认做 long source 自重建，对比 stream/offline，并额外输出 baseline 对照）：
+
+```bash
+source training/path.sh
+FLOW_CKPT=/abs/path/to/ft_flowv2_epoch_92_whole.pt \
+  bash training/scripts/reproduce_flow_stream_hop8.sh
+```
+
+默认关键参数：
+
+- `HOP_TOKENS=8`
+- `FLOW_TIMESTEPS=8`
+- `PROMPT_WAV=SOURCE_WAV=sample_inputs/esd_source_spk0002_neutral_u000282_long.wav`
+- 输出目录：`outputs/flow_stream_ep92_demo/`
+
+可覆盖示例：
+
+```bash
+FLOW_CKPT=/abs/path/to/ft_flowv2_epoch_92_whole.pt \
+PROMPT_WAV=sample_inputs/esd_prompt_spk0001_neutral_u000001.wav \
+SOURCE_WAV=sample_inputs/esd_source_spk0002_neutral_u000282_long.wav \
+RUN_BASELINE=0 \
+bash training/scripts/reproduce_flow_stream_hop8.sh
 ```
 
 ---
