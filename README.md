@@ -66,12 +66,33 @@ python scripts/download_weights.py --manifest weights_manifest.json --output-dir
 
 ---
 
-## 2. 推理（复制即可运行）
+## 2. 推理
 
-**用哪个 `python`**：在 §0 创建的虚拟环境里先 `source .venv/bin/activate`，下面命令里的 `python` 即该环境；或与 Marco-Voice 同目录树时用固定路径，例如  
-`/path/to/Marco-Voice/marco/bin/python infer.py ...`（`verify.sh` 会自动探测 `../marco/bin/python`）。
+**不要混用两节**：下面 **§2.1** 与 **§2.2** 是两条不同目的，按表格选 **其中一节** 即可。
 
-**示例输入**：仓库自带 **`sample_inputs/esd_source_spk0002_neutral_u000282_long.wav`**（ESD 长句，与 flow streaming 复现脚本默认一致）。未传 `--source_wav` 时与 `--prompt_wav` 相同，即自重建。
+| 你要做什么 | 打开哪一节 | 用的 flow 权重 |
+|------------|------------|----------------|
+| 快速听 **HF 包里自带的基线** `flow.pt`（不是 streaming 微调） | **§2.1** | `weights/flow.pt`（§1 已下载） |
+| **复现我们公开的 Flow Streaming v2 · EP92**（`hop_tokens=8`，`flow_timesteps=8`） | **§2.2** | Drive 上的 `ft_flowv2_epoch_92_whole.pt`，仍配合同一套 `weights/hift.pt` 等 |
+
+**两节共用**（照做一次即可）：
+
+- **`python`**：§0 里 `source .venv/bin/activate` 后用 `python`；或与 Marco-Voice 并排时用 `../marco/bin/python` / `export MARCO_PYTHON=...`（`verify.sh` 会自动探测 `../marco/bin/python`）。
+- **环境变量**：每条命令前在仓库根目录执行 `source training/path.sh`（`PYTHONPATH` 等）。
+- **示例长音频**：仓库自带 `sample_inputs/esd_source_spk0002_neutral_u000282_long.wav`。不传 `--source_wav` 时默认与 `--prompt_wav` 相同（自重建）。
+- **首次推理**：会从 ModelScope / Hugging Face **自动拉** emotion2vec 等（需联网）。读/写 wav 用 **torchaudio**；解码失败请装 **FFmpeg**（如 `apt-get install -y ffmpeg`）。
+
+自检（不加载大权重）：
+
+```bash
+cd marco-voice-v16v2-inference
+python infer.py --smoke_imports
+bash verify.sh
+```
+
+### 2.1 基线推理（`weights/flow.pt`，整段 flow，**不是** EP92 streaming 微调）
+
+用于确认 §1 权重与依赖正常；**不会**加载 Drive 上的 EP92。
 
 ```bash
 cd marco-voice-v16v2-inference
@@ -80,40 +101,42 @@ python infer.py \
   --weights_dir weights \
   --tokenizer_pt weights/s3_tokenizer.pt \
   --prompt_wav sample_inputs/esd_source_spk0002_neutral_u000282_long.wav \
-  --out_wav outputs/demo.wav
+  --out_wav outputs/demo_baseline_flow.wav
 ```
 
-首次运行会从 ModelScope / Hugging Face **自动拉取** emotion2vec 与 wav2vec（需联网），属正常现象。读 wav / 写 wav 走 **torchaudio**；若解码报错请本机安装 **FFmpeg**（如 `apt-get install -y ffmpeg`）。
+### 2.2 复现 Flow Streaming v2 · EP92（`hop_tokens=8`，`flow_timesteps=8`）
 
-自检（不加载大权重）：
-
-```bash
-python infer.py --smoke_imports
-bash verify.sh
-```
-
-### 2.1 复现 Flow Streaming v2（epoch 92，hop=8）
-
-我们将 flow streaming v2 的 `epoch_92_whole.pt`（CV 最优候选）公开在：
-
-- [ft_flowv2_epoch_92_whole.pt (Google Drive)](https://drive.google.com/file/d/1F4upBZ0mX6BKLO1S2dF3lrd7VyvP35sA/view?usp=drive_link)
-
-下载后可直接运行复现脚本（默认做 long source 自重建，对比 stream/offline，并额外输出 baseline 对照）：
+1. 完成 §1（`weights/` 里需有 `hift.pt` 等，与基线相同）。  
+2. 从 Drive 下载 **`epoch_92`** 整包权重（文件名可能为 `ft_flowv2_epoch_92_whole.pt`）：  
+   [ft_flowv2_epoch_92_whole.pt (Google Drive)](https://drive.google.com/file/d/1F4upBZ0mX6BKLO1S2dF3lrd7VyvP35sA/view?usp=drive_link)  
+3. **推荐**：一键脚本（长句自重建 + **stream / offline 对比**，默认再跑 baseline 对照；输出在 `outputs/flow_stream_ep92_demo/`）：
 
 ```bash
+cd marco-voice-v16v2-inference
 source training/path.sh
 FLOW_CKPT=/abs/path/to/ft_flowv2_epoch_92_whole.pt \
   bash training/scripts/reproduce_flow_stream_hop8.sh
 ```
 
-默认关键参数：
+脚本默认：`HOP_TOKENS=8`，`FLOW_TIMESTEPS=8`，`PROMPT_WAV=SOURCE_WAV=sample_inputs/esd_source_spk0002_neutral_u000282_long.wav`。
 
-- `HOP_TOKENS=8`
-- `FLOW_TIMESTEPS=8`
-- `PROMPT_WAV=SOURCE_WAV=sample_inputs/esd_source_spk0002_neutral_u000282_long.wav`
-- 输出目录：`outputs/flow_stream_ep92_demo/`
+**只要一条 stream wav、不要脚本里其它对照时**，等价于：
 
-可覆盖示例：
+```bash
+cd marco-voice-v16v2-inference
+source training/path.sh
+FLOW_CKPT=/abs/path/to/ft_flowv2_epoch_92_whole.pt
+python infer.py \
+  --weights_dir weights \
+  --tokenizer_pt weights/s3_tokenizer.pt \
+  --prompt_wav sample_inputs/esd_source_spk0002_neutral_u000282_long.wav \
+  --source_wav sample_inputs/esd_source_spk0002_neutral_u000282_long.wav \
+  --flow_ckpt "${FLOW_CKPT}" \
+  --flow_timesteps 8 --stream --hop_tokens 8 \
+  --out_wav outputs/flow_stream_ep92_demo/ep92_stream_manual.wav
+```
+
+可覆盖环境变量示例（仍用 EP92，换 prompt/source、关掉 baseline）：
 
 ```bash
 FLOW_CKPT=/abs/path/to/ft_flowv2_epoch_92_whole.pt \
