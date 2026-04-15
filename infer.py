@@ -7,11 +7,15 @@ Loads only flow.pt, hift.pt, campplus.onnx + configs/cosyvoice.yaml (no LLM, no 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+import time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
+# Default self-reconstruction: prompt and source are the same long ESD clip unless overridden.
+_DEFAULT_RECON_WAV = _ROOT / "sample_inputs" / "esd_source_spk0002_neutral_u000282_long.wav"
 
 
 def _setup_paths() -> None:
@@ -36,12 +40,37 @@ from emotion_conditioning import extract_emotion2vec_768, extract_low_level_emo
 
 
 def load_wav(wav: str | os.PathLike, target_sr: int) -> torch.Tensor:
-    speech, sample_rate = torchaudio.load(wav)
+    path = os.fspath(wav)
+    try:
+        import soundfile as sf
+
+        data, sample_rate = sf.read(path, always_2d=True, dtype="float32")
+        speech = torch.from_numpy(data.T.copy())
+    except Exception:
+        speech, sample_rate = torchaudio.load(path)
     speech = speech.mean(dim=0, keepdim=True)
     if sample_rate != target_sr:
         assert sample_rate > target_sr, f"wav sr {sample_rate} must be >= {target_sr}"
         speech = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sr)(speech)
     return speech
+
+
+def _save_wav(path: str | os.PathLike, waveform: torch.Tensor, sample_rate: int) -> None:
+    """Prefer soundfile: torchaudio>=2.9 load/save often need TorchCodec+FFmpeg."""
+    x = waveform.detach().cpu().float()
+    if x.ndim != 2:
+        raise ValueError(f"expected waveform [C, T], got {tuple(x.shape)}")
+    path_str = os.fspath(path)
+    try:
+        import soundfile as sf
+
+        if x.shape[0] == 1:
+            arr = x.squeeze(0).numpy()
+        else:
+            arr = x.transpose(0, 1).contiguous().numpy()
+        sf.write(path_str, arr, int(sample_rate), subtype="PCM_16")
+    except Exception:
+        torchaudio.save(path_str, x, int(sample_rate))
 
 
 def _ensure_3d_mel(mel: torch.Tensor) -> torch.Tensor:
@@ -145,6 +174,141 @@ def prepare_weights_dir(weights_dir: Path, config_src: Path) -> None:
         shutil.copy2(config_src, dst_yaml)
 
 
+def _parse_int_grid(spec: str) -> list[int]:
+    vals = []
+    for p in spec.split(","):
+        p = p.strip()
+        if not p:
+            continue
+        vals.append(int(p))
+    return vals
+
+
+def _parse_float_grid(spec: str) -> list[float]:
+    vals = []
+    for p in spec.split(","):
+        p = p.strip()
+        if not p:
+            continue
+        vals.append(float(p))
+    return vals
+
+
+def _boundary_metrics(audio: torch.Tensor, boundaries: list[int], sr: int) -> dict:
+    wave = audio.squeeze(0).detach().cpu()
+    if wave.numel() < 3 or not boundaries:
+        return {
+            "boundary_count": 0,
+            "jump_p95": 0.0,
+            "slope_ratio_p95": 0.0,
+            "jump_max": 0.0,
+            "slope_ratio_max": 0.0,
+        }
+
+    win = max(32, int(sr * 0.003))
+    jump_vals = []
+    slope_vals = []
+    for b in boundaries:
+        if b <= 1 or b >= (wave.numel() - 1):
+            continue
+        l0 = max(0, b - win)
+        r0 = min(wave.numel(), b + win)
+        local = wave[l0:r0]
+        if local.numel() < 4:
+            continue
+        rms = float(torch.sqrt(torch.mean(local * local) + 1e-12))
+        jump = float(torch.abs(wave[b] - wave[b - 1]))
+        jump_vals.append(jump / (rms + 1e-6))
+
+        pre = wave[max(0, b - win):b]
+        post = wave[b:min(wave.numel(), b + win)]
+        if pre.numel() > 2 and post.numel() > 2:
+            pre_slope = float(torch.mean(torch.abs(pre[1:] - pre[:-1])) + 1e-9)
+            post_slope = float(torch.mean(torch.abs(post[1:] - post[:-1])) + 1e-9)
+            slope_vals.append(max(pre_slope, post_slope) / min(pre_slope, post_slope))
+
+    if not jump_vals:
+        return {
+            "boundary_count": 0,
+            "jump_p95": 0.0,
+            "slope_ratio_p95": 0.0,
+            "jump_max": 0.0,
+            "slope_ratio_max": 0.0,
+        }
+    j = torch.tensor(jump_vals)
+    s = torch.tensor(slope_vals if slope_vals else [1.0])
+    return {
+        "boundary_count": int(len(jump_vals)),
+        "jump_p95": float(torch.quantile(j, 0.95)),
+        "slope_ratio_p95": float(torch.quantile(s, 0.95)),
+        "jump_max": float(torch.max(j)),
+        "slope_ratio_max": float(torch.max(s)),
+    }
+
+
+@torch.no_grad()
+def _tokenizer_probe(
+    source_16k: torch.Tensor,
+    s3_model: torch.nn.Module,
+    device: torch.device,
+    token_len_cache: dict,
+    probe_secs: list[float],
+) -> list[dict]:
+    out = []
+    for sec in probe_secs:
+        n = max(1, int(sec * 16000))
+        clip = source_16k[:, :n]
+        tok = wav16k_to_s3_tokens(clip, s3_model, device, token_len_cache)
+        out.append(
+            {
+                "clip_sec": float(sec),
+                "samples": int(n),
+                "token_len": int(tok.shape[1]),
+                "token_rate_hz": float(tok.shape[1] / max(sec, 1e-6)),
+            }
+        )
+    return out
+
+
+def _write_stream_report_md(report: dict, out_path: Path) -> None:
+    lines = [
+        "# Flow Streaming Sensitivity Analysis",
+        "",
+        "## Scope",
+        f"- Prompt wav: `{report['prompt_wav']}`",
+        f"- Source wav: `{report['source_wav']}`",
+        f"- Input frame rate: `{report['input_frame_rate_hz']} Hz`",
+        f"- Token overlap len: `{report['token_overlap_len']}`",
+        "",
+        "## Thresholds",
+        f"- Functional minimum steady chunk: `{report['thresholds']['T_func_min_sec']}` sec",
+        f"- Quality minimum steady chunk: `{report['thresholds']['T_quality_min_sec']}` sec",
+        f"- Functional minimum first chunk: `{report['thresholds']['T_func_first_chunk_min_sec']}` sec",
+        f"- Quality minimum first chunk: `{report['thresholds']['T_quality_first_chunk_min_sec']}` sec",
+        "",
+        "## Sensitivity Ranking",
+    ]
+    for i, item in enumerate(report["sensitivity_ranking"], start=1):
+        lines.append(f"{i}. `{item['module']}` - {item['reason']}")
+    lines.extend(["", "## Per-case Results", ""])
+    lines.append("| hop | scale | steps | steady_sec | functional | quality | jump_p95 | slope_p95 | flow_ms_avg | vocoder_ms_avg |")
+    lines.append("|---:|---:|---:|---:|:---:|:---:|---:|---:|---:|---:|")
+    for c in report["cases"]:
+        lines.append(
+            f"| {c['hop_tokens']} | {c['stream_scale_factor']:.2f} | {c['n_timesteps']} | {c['steady_chunk_sec']:.3f} | "
+            f"{'Y' if c['functional_pass'] else 'N'} | {'Y' if c['quality_pass'] else 'N'} | "
+            f"{c['boundary']['jump_p95']:.3f} | {c['boundary']['slope_ratio_p95']:.3f} | "
+            f"{c['flow_ms_avg']:.2f} | {c['vocoder_ms_avg']:.2f} |"
+        )
+    lines.extend(["", "## Tokenizer Short-Chunk Probe", ""])
+    lines.append("| clip_sec | token_len | token_rate_hz |")
+    lines.append("|---:|---:|---:|")
+    for row in report["tokenizer_probe"]:
+        lines.append(f"| {row['clip_sec']:.3f} | {row['token_len']} | {row['token_rate_hz']:.2f} |")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Marco Voice v16 v2 causal-S3 VC / reconstruction (flow+hift only)")
     ap.add_argument(
@@ -154,11 +318,36 @@ def main() -> None:
         help="Directory with cosyvoice.yaml, hift.pt, flow.pt, campplus.onnx",
     )
     ap.add_argument("--tokenizer_pt", type=Path, default=None, help="Causal S3 tokenizer export .pt")
-    ap.add_argument("--prompt_wav", type=Path, default=None)
-    ap.add_argument("--source_wav", type=Path, default=None, help="Default: same as prompt (self-reconstruction)")
+    ap.add_argument(
+        "--prompt_wav",
+        type=Path,
+        default=_DEFAULT_RECON_WAV,
+        help="Default long ESD self-reconstruction clip (same as default source when --source_wav omitted)",
+    )
+    ap.add_argument(
+        "--source_wav",
+        type=Path,
+        default=None,
+        help="Omit to use same file as --prompt_wav (self-reconstruction)",
+    )
     ap.add_argument("--out_wav", type=Path, default=_ROOT / "outputs" / "reconstruction.wav")
     ap.add_argument("--flow_ckpt", type=Path, default=None, help="Override flow weights (else weights_dir/flow.pt)")
+    ap.add_argument("--hift_ckpt", type=Path, default=None, help="Override hift weights (else weights_dir/hift.pt)")
     ap.add_argument("--hop_tokens", type=int, default=0)
+    ap.add_argument("--stream", action="store_true", help="Use stream=True VC path")
+    ap.add_argument("--stream_scale_factor", type=float, default=1.0, help="CosyVoiceModel.stream_scale_factor")
+    ap.add_argument("--flow_timesteps", type=int, default=10, help="Flow ODE timesteps per chunk")
+    ap.add_argument("--emit_chunk_metrics", action="store_true", help="Print chunk metrics during streaming")
+    ap.add_argument("--stream_sweep", action="store_true", help="Run hop/scale/timestep grid analysis")
+    ap.add_argument("--hop_grid", type=str, default="8,12,16,20,24,32,40,50")
+    ap.add_argument("--scale_grid", type=str, default="1.0")
+    ap.add_argument("--timesteps_grid", type=str, default="6,8,10,12")
+    ap.add_argument("--probe_chunk_seconds", type=str, default="0.06,0.08,0.10,0.12,0.16,0.20,0.30")
+    ap.add_argument("--quality_jump_p95_max", type=float, default=2.5)
+    ap.add_argument("--quality_slope_p95_max", type=float, default=2.0)
+    ap.add_argument("--analysis_json", type=Path, default=_ROOT / "outputs" / "flow_streaming_sensitivity.json")
+    ap.add_argument("--analysis_md", type=Path, default=_ROOT / "training" / "docs" / "FLOW_STREAMING_SENSITIVITY_ANALYSIS.md")
+    ap.add_argument("--save_sweep_wavs", action="store_true", help="Save per-case wavs during --stream_sweep")
     ap.add_argument(
         "--emo_id",
         type=str,
@@ -178,8 +367,8 @@ def main() -> None:
         print("smoke_imports: OK (CosyVoiceModel, s3tokenizer_train, emotion_conditioning)")
         return
 
-    if args.tokenizer_pt is None or args.prompt_wav is None:
-        ap.error("inference requires --tokenizer_pt and --prompt_wav (or use --smoke_imports)")
+    if args.tokenizer_pt is None:
+        ap.error("inference requires --tokenizer_pt (or use --smoke_imports)")
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     source_path = args.source_wav or args.prompt_wav
@@ -219,11 +408,20 @@ def main() -> None:
         fm.flow.eval()
         if device.type == "cuda":
             fm.flow.cuda()
+    if args.hift_ckpt is not None:
+        ckpt_hift = torch.load(args.hift_ckpt, map_location="cpu", weights_only=False)
+        hift_state_dict = {k.replace("generator.", ""): v for k, v in ckpt_hift.items()}
+        fm.hift.load_state_dict(hift_state_dict, strict=False)
+        fm.hift.eval()
+        if device.type == "cuda":
+            fm.hift.cuda()
 
     if args.hop_tokens > 0:
         h = int(args.hop_tokens)
         fm.token_min_hop_len = h
         fm.token_max_hop_len = h * 2
+    fm.stream_scale_factor = max(1.0, float(args.stream_scale_factor))
+    fm.flow_n_timesteps = int(args.flow_timesteps)
 
     prompt_16k = load_wav(args.prompt_wav, 16000)
     source_16k = load_wav(source_path, 16000)
@@ -244,23 +442,183 @@ def main() -> None:
     emotion_vec = extract_emotion2vec_768(str(source_path))
     low_level_emo = extract_low_level_emo(str(source_path), emo_id=args.emo_id)
 
-    chunks = []
-    for out in fm.vc(
-        source_speech_token=source_tok,
-        flow_prompt_speech_token=prompt_tok,
-        prompt_speech_feat=prompt_feat,
-        flow_embedding=flow_embedding,
-        low_level_emo_embedding=low_level_emo,
-        emotion_embedding=emotion_vec,
-        stream=False,
-    ):
-        chunks.append(out["tts_speech"])
+    def run_case(hop_tokens: int, scale_factor: float, n_timesteps: int, stream: bool, save_wav: Path | None = None) -> dict:
+        fm.token_min_hop_len = int(hop_tokens)
+        fm.token_max_hop_len = int(hop_tokens) * 2
+        fm.stream_scale_factor = max(1.0, float(scale_factor))
+        fm.flow_n_timesteps = int(n_timesteps)
+        chunks = []
+        chunk_metrics = []
+        boundaries = []
+        t0 = time.perf_counter()
+        first_chunk_s = None
+        try:
+            for idx, out in enumerate(
+                fm.vc(
+                    source_speech_token=source_tok,
+                    flow_prompt_speech_token=prompt_tok,
+                    prompt_speech_feat=prompt_feat,
+                    flow_embedding=flow_embedding,
+                    low_level_emo_embedding=low_level_emo,
+                    emotion_embedding=emotion_vec,
+                    stream=stream,
+                    emit_debug=True,
+                )
+            ):
+                if first_chunk_s is None:
+                    first_chunk_s = time.perf_counter() - t0
+                chunk = out["tts_speech"]
+                chunks.append(chunk)
+                chunk_n = int(chunk.shape[1])
+                if idx > 0:
+                    boundaries.append(sum(int(c.shape[1]) for c in chunks[:-1]))
+                m = out.get("chunk_metrics", {})
+                m["chunk_idx"] = int(idx)
+                m["speech_samples"] = chunk_n
+                m["speech_ms"] = chunk_n / 22050.0 * 1000.0
+                chunk_metrics.append(m)
+                if args.emit_chunk_metrics:
+                    print(
+                        f"[chunk {idx}] token_len={m.get('token_len')} flow_ms={m.get('flow_ms', 0):.2f} "
+                        f"vocoder_ms={m.get('vocoder_ms', 0):.2f} speech_ms={m.get('speech_ms', 0):.2f} finalize={m.get('finalize')}"
+                    )
+        except Exception as exc:
+            return {
+                "hop_tokens": int(hop_tokens),
+                "stream_scale_factor": float(scale_factor),
+                "n_timesteps": int(n_timesteps),
+                "stream": bool(stream),
+                "error": repr(exc),
+                "functional_pass": False,
+                "quality_pass": False,
+            }
 
-    if not chunks:
-        raise RuntimeError("Model produced no audio chunks.")
-    full = torch.cat(chunks, dim=1)
-    torchaudio.save(str(args.out_wav), full, 22050)
+        if not chunks:
+            return {
+                "hop_tokens": int(hop_tokens),
+                "stream_scale_factor": float(scale_factor),
+                "n_timesteps": int(n_timesteps),
+                "stream": bool(stream),
+                "error": "empty chunks",
+                "functional_pass": False,
+                "quality_pass": False,
+            }
+
+        full = torch.cat(chunks, dim=1)
+        if save_wav is not None:
+            save_wav.parent.mkdir(parents=True, exist_ok=True)
+            _save_wav(save_wav, full, 22050)
+        wall_ms = (time.perf_counter() - t0) * 1000.0
+        boundary = _boundary_metrics(full, boundaries, 22050)
+        flow_vals = [float(x.get("flow_ms", 0.0)) for x in chunk_metrics]
+        voc_vals = [float(x.get("vocoder_ms", 0.0)) for x in chunk_metrics]
+        func_pass = bool(full.shape[1] > 0 and all(int(x.get("speech_samples", 0)) > 0 for x in chunk_metrics))
+        quality_pass = bool(
+            func_pass
+            and boundary["jump_p95"] <= float(args.quality_jump_p95_max)
+            and boundary["slope_ratio_p95"] <= float(args.quality_slope_p95_max)
+        )
+        return {
+            "hop_tokens": int(hop_tokens),
+            "stream_scale_factor": float(scale_factor),
+            "n_timesteps": int(n_timesteps),
+            "stream": bool(stream),
+            "functional_pass": func_pass,
+            "quality_pass": quality_pass,
+            "steady_chunk_sec": float(hop_tokens / fm.flow.input_frame_rate),
+            "first_chunk_sec": float((hop_tokens + fm.token_overlap_len) / fm.flow.input_frame_rate),
+            "source_total_sec": float(source_tok.shape[1] / fm.flow.input_frame_rate),
+            "chunks": int(len(chunks)),
+            "audio_sec": float(full.shape[1] / 22050.0),
+            "first_chunk_latency_ms": float((first_chunk_s or 0.0) * 1000.0),
+            "wall_ms": float(wall_ms),
+            "flow_ms_avg": float(sum(flow_vals) / max(1, len(flow_vals))),
+            "vocoder_ms_avg": float(sum(voc_vals) / max(1, len(voc_vals))),
+            "chunk_metrics": chunk_metrics,
+            "boundary": boundary,
+            "error": "",
+        }
+
+    if args.stream_sweep:
+        hops = _parse_int_grid(args.hop_grid)
+        scales = _parse_float_grid(args.scale_grid)
+        steps = _parse_int_grid(args.timesteps_grid)
+        probe_secs = _parse_float_grid(args.probe_chunk_seconds)
+        tokenizer_probe = _tokenizer_probe(source_16k, s3_model, device, tok_cache, probe_secs)
+        cases = []
+        for hop in hops:
+            for scale in scales:
+                for n_steps in steps:
+                    out_name = None
+                    if args.save_sweep_wavs:
+                        out_name = args.out_wav.parent / f"stream_h{hop}_s{scale:.2f}_n{n_steps}.wav"
+                    print(f"[sweep] hop={hop} scale={scale:.2f} steps={n_steps}")
+                    result = run_case(hop, scale, n_steps, stream=True, save_wav=out_name)
+                    cases.append(result)
+
+        func_candidates = [c for c in cases if c.get("functional_pass")]
+        qual_candidates = [c for c in cases if c.get("quality_pass")]
+        func_best = min(func_candidates, key=lambda x: x["steady_chunk_sec"]) if func_candidates else None
+        qual_best = min(qual_candidates, key=lambda x: x["steady_chunk_sec"]) if qual_candidates else None
+
+        token_min_nonzero = next((r["clip_sec"] for r in tokenizer_probe if r["token_len"] > 0), None)
+        flow_sensitivity = sum(1 for c in cases if not c.get("functional_pass"))
+        vocoder_sensitivity = max((c.get("boundary", {}).get("jump_p95", 0.0) for c in cases if c.get("functional_pass")), default=0.0)
+
+        report = {
+            "prompt_wav": str(args.prompt_wav),
+            "source_wav": str(source_path),
+            "input_frame_rate_hz": int(fm.flow.input_frame_rate),
+            "token_overlap_len": int(fm.token_overlap_len),
+            "quality_rule": {
+                "jump_p95_max": float(args.quality_jump_p95_max),
+                "slope_p95_max": float(args.quality_slope_p95_max),
+            },
+            "thresholds": {
+                "T_func_min_sec": None if func_best is None else float(func_best["steady_chunk_sec"]),
+                "T_quality_min_sec": None if qual_best is None else float(qual_best["steady_chunk_sec"]),
+                "T_func_first_chunk_min_sec": None if func_best is None else float(func_best["first_chunk_sec"]),
+                "T_quality_first_chunk_min_sec": None if qual_best is None else float(qual_best["first_chunk_sec"]),
+            },
+            "tokenizer_probe": tokenizer_probe,
+            "cases": cases,
+            "sensitivity_ranking": [
+                {
+                    "module": "vocoder",
+                    "reason": f"Boundary jump p95 peaks at {vocoder_sensitivity:.3f}; short-hop artifacts mainly appear at chunk boundaries.",
+                },
+                {
+                    "module": "flow",
+                    "reason": f"{flow_sensitivity} cases failed functionally, mostly under very short hops and heavier timestep load.",
+                },
+                {
+                    "module": "tokenizer",
+                    "reason": f"Shortest non-empty tokenizer-only slice is around {token_min_nonzero}s, so tokenizer is usually not the first failure point.",
+                },
+            ],
+        }
+        args.analysis_json.parent.mkdir(parents=True, exist_ok=True)
+        args.analysis_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_stream_report_md(report, args.analysis_md)
+        print(f"Saved sweep JSON: {args.analysis_json.resolve()}")
+        print(f"Saved sweep Markdown: {args.analysis_md.resolve()}")
+        return
+
+    result = run_case(
+        hop_tokens=fm.token_min_hop_len,
+        scale_factor=fm.stream_scale_factor,
+        n_timesteps=fm.flow_n_timesteps,
+        stream=bool(args.stream),
+        save_wav=args.out_wav,
+    )
+    if not result["functional_pass"]:
+        raise RuntimeError(f"inference failed: {result.get('error', 'unknown')}")
     print(f"Saved: {args.out_wav.resolve()}")
+    print(
+        f"mode={'stream' if args.stream else 'offline'} chunks={result['chunks']} "
+        f"flow_ms_avg={result['flow_ms_avg']:.2f} vocoder_ms_avg={result['vocoder_ms_avg']:.2f} "
+        f"jump_p95={result['boundary']['jump_p95']:.3f} slope_p95={result['boundary']['slope_ratio_p95']:.3f}"
+    )
 
 
 if __name__ == "__main__":

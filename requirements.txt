@@ -1,6 +1,7 @@
 # Python >= 3.10 recommended. CUDA PyTorch wheel: install from https://pytorch.org first if needed.
 torch>=2.1.0
 torchaudio>=2.1.0
+soundfile>=0.12.0
 openai-whisper
 onnxruntime
 numpy

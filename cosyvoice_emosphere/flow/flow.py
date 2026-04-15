@@ -22,6 +22,15 @@ from torch.nn import functional as F
 from omegaconf import DictConfig
 from cosyvoice_emosphere.utils.mask import make_pad_mask
 import numpy as np
+from cosyvoice_emosphere.flow.streaming_loss import (
+    boundary_continuity_l1,
+    build_stream_chunk_pairs,
+    overlap_consistency_l1,
+    resolve_curriculum_phase,
+    sample_hop_and_overlap_tokens,
+    temporal_delta_l1,
+    tokens_to_mel_frames,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +246,28 @@ class MaskedDiffWithXvec(torch.nn.Module):
                  speech_tokenizer_onnx: str = '',
                  # --- v17: token temporal downsampling ---
                  token_downsample_stride: int = 1,
+                 # --- flow streaming regularization ---
+                 stream_consistency_weight: float = 0.0,
+                 stream_consistency_hop_tokens: int = 8,
+                 stream_consistency_overlap_tokens: int = 20,
+                 stream_consistency_max_pairs: int = 2,
+                 stream_consistency_eval_t: float = 0.5,
+                 stream_anchor_mel_weight: float = 0.0,
+                 stream_anchor_delta_weight: float = 0.0,
+                 stream_boundary_cont_weight: float = 0.0,
+                 stream_hop_tokens_candidates: Optional[list] = None,
+                 stream_hop_tokens_probs: Optional[list] = None,
+                 stream_overlap_jitter_tokens: int = 0,
+                 stream_loss_min_frames: int = 0,
+                 stream_curriculum_total_steps: int = 0,
+                 stream_curriculum_phase_a_ratio: float = 0.2,
+                 stream_curriculum_phase_b_ratio: float = 0.5,
+                 stream_phase_a_hop_tokens_candidates: Optional[list] = None,
+                 stream_phase_a_hop_tokens_probs: Optional[list] = None,
+                 stream_phase_b_hop_tokens_candidates: Optional[list] = None,
+                 stream_phase_b_hop_tokens_probs: Optional[list] = None,
+                 stream_phase_c_hop_tokens_candidates: Optional[list] = None,
+                 stream_phase_c_hop_tokens_probs: Optional[list] = None,
                  # ---------------------------------------------------------
                  encoder: torch.nn.Module = None,
                  length_regulator: torch.nn.Module = None,
@@ -357,6 +388,47 @@ class MaskedDiffWithXvec(torch.nn.Module):
                 f"= {input_frame_rate // token_downsample_stride} Hz, "
                 f"bitrate {input_frame_rate // token_downsample_stride * 12} bps "
                 f"(no extra parameters)"
+            )
+
+        # --- flow streaming regularization ---
+        self.stream_consistency_weight = float(stream_consistency_weight)
+        self.stream_consistency_hop_tokens = int(stream_consistency_hop_tokens)
+        self.stream_consistency_overlap_tokens = int(stream_consistency_overlap_tokens)
+        self.stream_consistency_max_pairs = int(stream_consistency_max_pairs)
+        self.stream_consistency_eval_t = float(stream_consistency_eval_t)
+        self.stream_anchor_mel_weight = float(stream_anchor_mel_weight)
+        self.stream_anchor_delta_weight = float(stream_anchor_delta_weight)
+        self.stream_boundary_cont_weight = float(stream_boundary_cont_weight)
+        self.stream_hop_tokens_candidates = [int(x) for x in (stream_hop_tokens_candidates or []) if int(x) > 0]
+        self.stream_hop_tokens_probs = [float(x) for x in (stream_hop_tokens_probs or [])]
+        self.stream_overlap_jitter_tokens = int(stream_overlap_jitter_tokens)
+        self.stream_loss_min_frames = int(stream_loss_min_frames)
+        self.stream_curriculum_total_steps = int(stream_curriculum_total_steps)
+        self.stream_curriculum_phase_a_ratio = float(stream_curriculum_phase_a_ratio)
+        self.stream_curriculum_phase_b_ratio = float(stream_curriculum_phase_b_ratio)
+        self.stream_phase_a_hop_tokens_candidates = [int(x) for x in (stream_phase_a_hop_tokens_candidates or []) if int(x) > 0]
+        self.stream_phase_a_hop_tokens_probs = [float(x) for x in (stream_phase_a_hop_tokens_probs or [])]
+        self.stream_phase_b_hop_tokens_candidates = [int(x) for x in (stream_phase_b_hop_tokens_candidates or []) if int(x) > 0]
+        self.stream_phase_b_hop_tokens_probs = [float(x) for x in (stream_phase_b_hop_tokens_probs or [])]
+        self.stream_phase_c_hop_tokens_candidates = [int(x) for x in (stream_phase_c_hop_tokens_candidates or []) if int(x) > 0]
+        self.stream_phase_c_hop_tokens_probs = [float(x) for x in (stream_phase_c_hop_tokens_probs or [])]
+        self._stream_curriculum_step = 0
+        if (
+            self.stream_consistency_weight > 0
+            or self.stream_anchor_mel_weight > 0
+            or self.stream_anchor_delta_weight > 0
+            or self.stream_boundary_cont_weight > 0
+        ):
+            logging.info(
+                "[flow-stream-ft] stream regularizers enabled: consistency=%.4f anchor_mel=%.4f anchor_delta=%.4f boundary=%.4f hop_tokens=%d overlap_tokens=%d max_pairs=%d eval_t=%.3f",
+                self.stream_consistency_weight,
+                self.stream_anchor_mel_weight,
+                self.stream_anchor_delta_weight,
+                self.stream_boundary_cont_weight,
+                self.stream_consistency_hop_tokens,
+                self.stream_consistency_overlap_tokens,
+                self.stream_consistency_max_pairs,
+                self.stream_consistency_eval_t,
             )
 
     def init_tokenizer_proj_from_codebook(self):
@@ -537,6 +609,101 @@ class MaskedDiffWithXvec(torch.nn.Module):
             cond=conds,
         )
 
+        stream_consistency_loss = torch.tensor(0.0, device=device)
+        stream_anchor_mel_loss = torch.tensor(0.0, device=device)
+        stream_anchor_delta_loss = torch.tensor(0.0, device=device)
+        stream_boundary_cont_loss = torch.tensor(0.0, device=device)
+        if self.stream_consistency_max_pairs > 0 and (
+            self.stream_consistency_weight > 0
+            or self.stream_anchor_mel_weight > 0
+            or self.stream_anchor_delta_weight > 0
+            or self.stream_boundary_cont_weight > 0
+        ):
+            hop_candidates = self.stream_hop_tokens_candidates
+            hop_probs = self.stream_hop_tokens_probs
+            if self.stream_curriculum_total_steps > 0:
+                progress = float(self._stream_curriculum_step) / float(max(1, self.stream_curriculum_total_steps))
+                phase = resolve_curriculum_phase(
+                    progress=progress,
+                    phase_a_ratio=self.stream_curriculum_phase_a_ratio,
+                    phase_b_ratio=self.stream_curriculum_phase_b_ratio,
+                )
+                if phase == "A":
+                    hop_candidates = self.stream_phase_a_hop_tokens_candidates or hop_candidates
+                    hop_probs = self.stream_phase_a_hop_tokens_probs or hop_probs
+                elif phase == "B":
+                    hop_candidates = self.stream_phase_b_hop_tokens_candidates or hop_candidates
+                    hop_probs = self.stream_phase_b_hop_tokens_probs or hop_probs
+                else:
+                    hop_candidates = self.stream_phase_c_hop_tokens_candidates or hop_candidates
+                    hop_probs = self.stream_phase_c_hop_tokens_probs or hop_probs
+                self._stream_curriculum_step += 1
+
+            hop_tokens, overlap_tokens = sample_hop_and_overlap_tokens(
+                default_hop_tokens=self.stream_consistency_hop_tokens,
+                default_overlap_tokens=self.stream_consistency_overlap_tokens,
+                hop_candidates=hop_candidates,
+                hop_probs=hop_probs,
+                overlap_jitter_tokens=self.stream_overlap_jitter_tokens,
+            )
+            hop_frames = tokens_to_mel_frames(hop_tokens, self.input_frame_rate)
+            overlap_frames = tokens_to_mel_frames(overlap_tokens, self.input_frame_rate)
+            pair_losses = []
+            anchor_losses = []
+            delta_losses = []
+            boundary_losses = []
+            t_value = torch.full((1,), self.stream_consistency_eval_t, device=device, dtype=h.dtype)
+            # Keep regularizer memory bounded: apply to at most one sample per batch.
+            for b in range(min(h.shape[0], 1)):
+                valid_t = int(feat_len[b].item())
+                if valid_t <= 0:
+                    continue
+                if self.stream_loss_min_frames > 0 and valid_t < self.stream_loss_min_frames:
+                    continue
+                spans = build_stream_chunk_pairs(
+                    total_frames=valid_t,
+                    hop_frames=hop_frames,
+                    overlap_frames=overlap_frames,
+                    max_pairs=self.stream_consistency_max_pairs,
+                )
+                if not spans:
+                    continue
+                spk_b = cond_embedding[b:b + 1]
+                for left_s, left_e, right_s, right_e in spans:
+                    mu_left = h[b:b + 1, left_s:left_e, :].transpose(1, 2).contiguous()
+                    cond_left = conds[b:b + 1, :, left_s:left_e].contiguous()
+                    mu_right = h[b:b + 1, right_s:right_e, :].transpose(1, 2).contiguous()
+                    cond_right = conds[b:b + 1, :, right_s:right_e].contiguous()
+                    mask_left = torch.ones((1, 1, mu_left.shape[-1]), device=device, dtype=mu_left.dtype)
+                    mask_right = torch.ones((1, 1, mu_right.shape[-1]), device=device, dtype=mu_right.dtype)
+
+                    # Use the same deterministic input to expose chunk-context mismatch.
+                    out_left = self.decoder.estimator(mu_left, mask_left, mu_left, t_value, spk_b, cond_left)
+                    out_right = self.decoder.estimator(mu_right, mask_right, mu_right, t_value, spk_b, cond_right)
+                    if self.stream_consistency_weight > 0:
+                        pair_losses.append(overlap_consistency_l1(out_left, out_right, overlap_frames))
+                    if self.stream_boundary_cont_weight > 0:
+                        boundary_losses.append(boundary_continuity_l1(out_left, out_right, overlap_frames))
+                    if self.stream_anchor_mel_weight > 0 or self.stream_anchor_delta_weight > 0:
+                        # Use ground-truth mel slices as stable teacher targets to avoid
+                        # expensive full-sequence estimator passes that can OOM on long utterances.
+                        target_left = feat[b:b + 1, left_s:left_e, :].transpose(1, 2).contiguous()
+                        target_right = feat[b:b + 1, right_s:right_e, :].transpose(1, 2).contiguous()
+                        if self.stream_anchor_mel_weight > 0:
+                            anchor_losses.append(F.l1_loss(out_left, target_left))
+                            anchor_losses.append(F.l1_loss(out_right, target_right))
+                        if self.stream_anchor_delta_weight > 0:
+                            delta_losses.append(temporal_delta_l1(out_left, target_left))
+                            delta_losses.append(temporal_delta_l1(out_right, target_right))
+            if pair_losses:
+                stream_consistency_loss = torch.stack(pair_losses).mean() * self.stream_consistency_weight
+            if anchor_losses:
+                stream_anchor_mel_loss = torch.stack(anchor_losses).mean() * self.stream_anchor_mel_weight
+            if delta_losses:
+                stream_anchor_delta_loss = torch.stack(delta_losses).mean() * self.stream_anchor_delta_weight
+            if boundary_losses:
+                stream_boundary_cont_loss = torch.stack(boundary_losses).mean() * self.stream_boundary_cont_weight
+
         # L2 anchor: penalize deviation from init weights to prevent catastrophic forgetting
         anchor_loss = torch.tensor(0.0, device=device)
         if hasattr(self, '_anchor_weights') and self._anchor_weight > 0:
@@ -549,13 +716,26 @@ class MaskedDiffWithXvec(torch.nn.Module):
                     anchor_loss = anchor_loss + ((param - ref) ** 2).sum()
             anchor_loss = self._anchor_weight * anchor_loss
 
-        total_loss = mel_loss + lort_loss + con_loss + anchor_loss
+        total_loss = (
+            mel_loss
+            + lort_loss
+            + con_loss
+            + anchor_loss
+            + stream_consistency_loss
+            + stream_anchor_mel_loss
+            + stream_anchor_delta_loss
+            + stream_boundary_cont_loss
+        )
 
         return {'loss': total_loss,
                 'mel_loss': mel_loss.detach(),
                 'orth_loss': lort_loss.detach() if torch.is_tensor(lort_loss) else lort_loss,
                 'con_loss': con_loss.detach() if torch.is_tensor(con_loss) else con_loss,
-                'anchor_loss': anchor_loss.detach() if torch.is_tensor(anchor_loss) else anchor_loss}
+                'anchor_loss': anchor_loss.detach() if torch.is_tensor(anchor_loss) else anchor_loss,
+                'stream_consistency_loss': stream_consistency_loss.detach(),
+                'stream_anchor_mel_loss': stream_anchor_mel_loss.detach(),
+                'stream_anchor_delta_loss': stream_anchor_delta_loss.detach(),
+                'stream_boundary_cont_loss': stream_boundary_cont_loss.detach()}
 
     # -----------------------------------------------------------------------
     # Inference
@@ -572,7 +752,8 @@ class MaskedDiffWithXvec(torch.nn.Module):
                   embedding,
                   low_level_emo_embedding,
                   emotion_embedding,
-                  flow_cache):
+                  flow_cache,
+                  n_timesteps: int = 10):
         if low_level_emo_embedding.ndim == 1:
             low_level_emo_embedding = low_level_emo_embedding.unsqueeze(0)
         if emotion_embedding.ndim == 1:
@@ -643,7 +824,7 @@ class MaskedDiffWithXvec(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=cond_embedding,
             cond=conds,
-            n_timesteps=10,
+            n_timesteps=int(n_timesteps),
             prompt_len=mel_len1,
             flow_cache=flow_cache,
         )

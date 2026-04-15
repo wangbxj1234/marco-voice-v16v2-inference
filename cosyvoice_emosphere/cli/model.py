@@ -46,6 +46,7 @@ class CosyVoiceModel:
         self.speech_window = np.hamming(2 * self.source_cache_len)
         # rtf and decoding related
         self.stream_scale_factor = 1
+        self.flow_n_timesteps = 10
         assert self.stream_scale_factor >= 1, 'stream_scale_factor should be greater than 1, change it according to your actual rtf'
         self.llm_context = torch.cuda.stream(torch.cuda.Stream(self.device)) if torch.cuda.is_available() else nullcontext()
         self.lock = threading.Lock()
@@ -107,29 +108,29 @@ class CosyVoiceModel:
                 self.tts_speech_token_dict[uuid].append(i)
         self.llm_end_dict[uuid] = True
 
-    def token2wav(self, token, prompt_token, prompt_feat, embedding, low_level_emo_embedding, emotion_embedding, uuid, finalize=False, speed=1.0):
-        tts_mel, flow_cache = self.flow.inference(token=token.to(self.device).long(),
-                                                  token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
-                                                  prompt_token=prompt_token.to(self.device),
-                                                  prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32).to(self.device),
-                                                  prompt_feat=prompt_feat.to(self.device),
-                                                  prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32).to(self.device),
-                                                  embedding=embedding.to(self.device),
-                                                  low_level_emo_embedding = torch.tensor(low_level_emo_embedding).to(self.device),
-                                                  emotion_embedding = torch.tensor(emotion_embedding).to(self.device),
-                                                  flow_cache=self.flow_cache_dict[uuid])
-        self.flow_cache_dict[uuid] = flow_cache
+    def vocoder_from_mel(
+        self,
+        uuid,
+        tts_mel: torch.Tensor,
+        finalize: bool = False,
+        speed: float = 1.0,
+        return_debug: bool = False,
+        flow_ms: float | None = None,
+        source_token_len_for_debug: int | None = None,
+    ):
+        """HiFT path only (mel -> wav), with the same overlap/cache/fade as token2wav after flow."""
+        if tts_mel.device != self.device:
+            tts_mel = tts_mel.to(self.device)
 
-        # mel overlap fade in out
         if self.mel_overlap_dict[uuid].shape[2] != 0:
             tts_mel = fade_in_out(tts_mel, self.mel_overlap_dict[uuid], self.mel_window)
-        # append hift cache
         if self.hift_cache_dict[uuid] is not None:
             hift_cache_mel, hift_cache_source = self.hift_cache_dict[uuid]['mel'], self.hift_cache_dict[uuid]['source']
             tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
         else:
             hift_cache_source = torch.zeros(1, 1, 0)
-        # keep overlap mel and hift cache
+        mel_for_vocoder_len = int(tts_mel.shape[2])
+        t1 = time.perf_counter()
         if finalize is False:
             self.mel_overlap_dict[uuid] = tts_mel[:, :, -self.mel_overlap_len:]
             tts_mel = tts_mel[:, :, :-self.mel_overlap_len]
@@ -147,7 +148,48 @@ class CosyVoiceModel:
             tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
             if self.hift_cache_dict[uuid] is not None:
                 tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
+        vocoder_ms = (time.perf_counter() - t1) * 1000.0
+
+        if return_debug:
+            dbg_flow = 0.0 if flow_ms is None else float(flow_ms)
+            dbg_tok = int(source_token_len_for_debug) if source_token_len_for_debug is not None else -1
+            debug = {
+                'token_len': dbg_tok,
+                'flow_mel_len': int(tts_mel.shape[2]),
+                'mel_for_vocoder_len': mel_for_vocoder_len,
+                'speech_samples': int(tts_speech.shape[1]),
+                'flow_ms': dbg_flow,
+                'vocoder_ms': float(vocoder_ms),
+                'finalize': bool(finalize),
+                'n_timesteps': int(self.flow_n_timesteps),
+            }
+            return tts_speech, debug
         return tts_speech
+
+    def token2wav(self, token, prompt_token, prompt_feat, embedding, low_level_emo_embedding, emotion_embedding, uuid, finalize=False, speed=1.0, return_debug=False):
+        t0 = time.perf_counter()
+        tts_mel, flow_cache = self.flow.inference(token=token.to(self.device).long(),
+                                                  token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
+                                                  prompt_token=prompt_token.to(self.device),
+                                                  prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32).to(self.device),
+                                                  prompt_feat=prompt_feat.to(self.device),
+                                                  prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32).to(self.device),
+                                                  embedding=embedding.to(self.device),
+                                                  low_level_emo_embedding = torch.tensor(low_level_emo_embedding).to(self.device),
+                                                  emotion_embedding = torch.tensor(emotion_embedding).to(self.device),
+                                                  flow_cache=self.flow_cache_dict[uuid],
+                                                  n_timesteps=self.flow_n_timesteps)
+        self.flow_cache_dict[uuid] = flow_cache
+        flow_ms = (time.perf_counter() - t0) * 1000.0
+        return self.vocoder_from_mel(
+            uuid,
+            tts_mel,
+            finalize=finalize,
+            speed=speed,
+            return_debug=return_debug,
+            flow_ms=flow_ms,
+            source_token_len_for_debug=int(token.shape[1]),
+        )
 
     def tts(self, text, flow_embedding, llm_embedding=torch.zeros(0, 192),
             emotion_embedding=torch.zeros(0, 768),
@@ -222,7 +264,7 @@ class CosyVoiceModel:
             self.flow_cache_dict.pop(this_uuid)
 
     def vc(self, source_speech_token, flow_prompt_speech_token, prompt_speech_feat, flow_embedding,
-           low_level_emo_embedding=None, emotion_embedding=None, stream=False, speed=1.0, **kwargs):
+           low_level_emo_embedding=None, emotion_embedding=None, stream=False, speed=1.0, emit_debug=False, **kwargs):
         # this_uuid is used to track variables related to this inference thread
         this_uuid = str(uuid.uuid1())
         if low_level_emo_embedding is None:
@@ -247,8 +289,13 @@ class CosyVoiceModel:
                                                      low_level_emo_embedding=low_level_emo_embedding,
                                                      emotion_embedding=emotion_embedding,
                                                      uuid=this_uuid,
-                                                     finalize=False)
-                    yield {'tts_speech': this_tts_speech.cpu()}
+                                                     finalize=False,
+                                                     return_debug=emit_debug)
+                    if emit_debug:
+                        speech_tensor, debug = this_tts_speech
+                        yield {'tts_speech': speech_tensor.cpu(), 'chunk_metrics': debug}
+                    else:
+                        yield {'tts_speech': this_tts_speech.cpu()}
                     with self.lock:
                         self.tts_speech_token_dict[this_uuid] = self.tts_speech_token_dict[this_uuid][token_hop_len:]
                     # increase token_hop_len for better speech quality
@@ -264,8 +311,13 @@ class CosyVoiceModel:
                                              low_level_emo_embedding=low_level_emo_embedding,
                                              emotion_embedding=emotion_embedding,
                                              uuid=this_uuid,
-                                             finalize=True)
-            yield {'tts_speech': this_tts_speech.cpu()}
+                                             finalize=True,
+                                             return_debug=emit_debug)
+            if emit_debug:
+                speech_tensor, debug = this_tts_speech
+                yield {'tts_speech': speech_tensor.cpu(), 'chunk_metrics': debug}
+            else:
+                yield {'tts_speech': this_tts_speech.cpu()}
         else:
             # deal with all tokens
             this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
@@ -277,10 +329,16 @@ class CosyVoiceModel:
                                              emotion_embedding=emotion_embedding,
                                              uuid=this_uuid,
                                              finalize=True,
-                                             speed=speed)
-            yield {'tts_speech': this_tts_speech.cpu()}
+                                             speed=speed,
+                                             return_debug=emit_debug)
+            if emit_debug:
+                speech_tensor, debug = this_tts_speech
+                yield {'tts_speech': speech_tensor.cpu(), 'chunk_metrics': debug}
+            else:
+                yield {'tts_speech': this_tts_speech.cpu()}
         with self.lock:
             self.tts_speech_token_dict.pop(this_uuid)
             self.llm_end_dict.pop(this_uuid)
             self.mel_overlap_dict.pop(this_uuid)
             self.hift_cache_dict.pop(this_uuid)
+            self.flow_cache_dict.pop(this_uuid)
