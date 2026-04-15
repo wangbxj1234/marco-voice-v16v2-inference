@@ -40,37 +40,12 @@ from emotion_conditioning import extract_emotion2vec_768, extract_low_level_emo
 
 
 def load_wav(wav: str | os.PathLike, target_sr: int) -> torch.Tensor:
-    path = os.fspath(wav)
-    try:
-        import soundfile as sf
-
-        data, sample_rate = sf.read(path, always_2d=True, dtype="float32")
-        speech = torch.from_numpy(data.T.copy())
-    except Exception:
-        speech, sample_rate = torchaudio.load(path)
+    speech, sample_rate = torchaudio.load(wav)
     speech = speech.mean(dim=0, keepdim=True)
     if sample_rate != target_sr:
         assert sample_rate > target_sr, f"wav sr {sample_rate} must be >= {target_sr}"
         speech = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sr)(speech)
     return speech
-
-
-def _save_wav(path: str | os.PathLike, waveform: torch.Tensor, sample_rate: int) -> None:
-    """Prefer soundfile: torchaudio>=2.9 load/save often need TorchCodec+FFmpeg."""
-    x = waveform.detach().cpu().float()
-    if x.ndim != 2:
-        raise ValueError(f"expected waveform [C, T], got {tuple(x.shape)}")
-    path_str = os.fspath(path)
-    try:
-        import soundfile as sf
-
-        if x.shape[0] == 1:
-            arr = x.squeeze(0).numpy()
-        else:
-            arr = x.transpose(0, 1).contiguous().numpy()
-        sf.write(path_str, arr, int(sample_rate), subtype="PCM_16")
-    except Exception:
-        torchaudio.save(path_str, x, int(sample_rate))
 
 
 def _ensure_3d_mel(mel: torch.Tensor) -> torch.Tensor:
@@ -507,7 +482,7 @@ def main() -> None:
         full = torch.cat(chunks, dim=1)
         if save_wav is not None:
             save_wav.parent.mkdir(parents=True, exist_ok=True)
-            _save_wav(save_wav, full, 22050)
+            torchaudio.save(str(save_wav), full, 22050)
         wall_ms = (time.perf_counter() - t0) * 1000.0
         boundary = _boundary_metrics(full, boundaries, 22050)
         flow_vals = [float(x.get("flow_ms", 0.0)) for x in chunk_metrics]
